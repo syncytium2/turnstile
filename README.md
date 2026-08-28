@@ -61,6 +61,13 @@ directly**:
 
 ## The five guarantees
 
+> ⚠ **Under review, and four of these five are contested.** An eleven-role murderboard run
+> on 2026-08-28 reproduced a failure of guarantees 1, 2, 3 and 5 against the shipped code —
+> see [`docs/reviews/README_2026-08-28.md`](docs/reviews/README_2026-08-28.md). No fix has
+> been chosen: the two remedies are different projects and the run stopped at synthesis and
+> handed the decision back. Read them as **claims about intent** until that decision is
+> taken, not as a description of what the code does today.
+
 Each exists because the unwrapped version failed somewhere real.
 
 1. **A hook you did not declare a gate cannot block you.** Hooks are advisory by default;
@@ -114,6 +121,14 @@ completely broken, which is why that harness exists.
 
 Every guarantee above has an assertion in `turnstile-run --selftest`, and four mutations in
 `mutation_check.sh` break the wrapper on purpose and require it to notice.
+
+> ⚠ **That sentence is literally true and materially false, and this repo's own review is
+> what says so.** For guarantees 2 and 3 the assertions cannot distinguish a working wrapper
+> from a broken one — `3a`/`3b` `touch` the breadcrumb by hand and never exercise the drop,
+> and `2a` passes for the wrong reason because an off-by-one `elapsed` clause covers for an
+> absent kill. The four wrapper mutations target the reporting branches, not the crumb-drop
+> or watchdog lines. Both were demonstrated by mutation in
+> [`docs/reviews/README_2026-08-28.md`](docs/reviews/README_2026-08-28.md).
 
 **It has already caught itself twice.** `turnstile check` reported that `turnstile-run` had
 no `--selftest`, before it was committed. And the first version read declarations from the
