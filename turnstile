@@ -1,0 +1,229 @@
+#!/usr/bin/env sh
+# turnstile — decide whether a thing should be a hook, and find out whether yours work.
+#
+#   turnstile decide          the decision tree, printed
+#   turnstile check           what is installed here, and what is wrong with it
+#   turnstile test            run every hook's --selftest
+#   turnstile off | on | status     the global kill switch
+#   turnstile new <name>      scaffold a survivable gate
+#   turnstile --selftest
+#
+# WHY A SEPARATE FILE FROM `turnstile-run`. That one runs on the critical path, so it is
+# POSIX sh with no interpreter dependency -- a sibling hook in this estate shipped to
+# seven repos exiting 0 for every call because `python` was missing from a hook's login
+# PATH. This one is typed by a human at a prompt and never runs during a session, so it
+# may use python for JSON. The rule is the boundary, not the language: **nothing on the
+# critical path may depend on an interpreter that might not be there.**
+
+set -u
+# NEVER cd. `check` inspects the repo you are standing in, full stop.
+#
+# The first version hardcoded SELF_DIR="tools/turnstile" and was therefore broken in its
+# own repository -- a tool that only works inside the consumer is not a vendorable tool,
+# it is a copy. The second computed it after a `cd` that walked ABOVE the repo when no
+# .claude/settings.json was present, so it then could not find its own siblings. Both are
+# the same mistake: resolving a path relative to an assumption about where you are.
+#
+# SELF is absolute so file access always works. SELF_REL is what gets PRINTED, because a
+# settings.json carrying an absolute path is machine-specific and breaks the moment anyone
+# else clones the repo.
+SELF_DIR=$(cd "$(dirname "$0")" && pwd)
+case "$SELF_DIR" in
+    "$PWD"/*) SELF_REL=".${SELF_DIR#$PWD}" ;;
+    "$PWD")   SELF_REL="." ;;
+    *)        SELF_REL="$SELF_DIR" ;;
+esac
+STATE="${HOME}/.turnstile"
+KILL_SWITCH="${HOME}/.turnstile-off"
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+
+decide() {
+cat <<'TREE'
+
+  SHOULD THIS BE A HOOK?
+  ══════════════════════
+
+  Start here, and stop at the first yes.
+
+  1 ─ Can a person just... not do the thing?
+      └─ YES → write it down. A note is rung 1. It is weak, and it is free, and
+               most things belong here. Do not pretend it is enforcement.
+
+  2 ─ Would you notice within a minute if it went wrong?
+      └─ YES → a checklist or a habit. Rung 2. Cheap, visible, no machinery.
+
+  3 ─ Can you check it with a command you choose to run?
+      └─ YES → ★ WRITE A TEST. Rung 3, and this is where most people should stop.
+               A test and a hook enforce the same rule. A broken test costs you a
+               red line. A broken hook costs you your session.
+               Prefer the mechanism whose failure is loud and cheap.
+
+  4 ─ Does it have to fire without anyone remembering, at the moment of the act?
+      └─ YES → a hook. Rung 4. Now answer WHICH:
+
+           Does it need to inspect a command BEFORE it runs?
+             └─ YES → PreToolUse.  ✔ This is the survivable shape.
+                      Small, synchronous, one job, testable by piping a
+                      payload and reading an exit code.
+
+             └─ NO, it wants to brief me at session start?
+                      ⚠ SessionStart. Read this before you do:
+                      · it is on the BLOCKING path — slow means no session
+                      · the editor aborts startup at a hardcoded 60s
+                      · a skipped guard looks exactly like a passed one
+                      · they accrete: this estate has one at 39KB
+                      If you still want it: keep it under a second, put the
+                      slow half behind `turnstile-run`, and make it PRINT
+                      WHAT IT SKIPPED.
+
+  5 ─ Could you make the wrong thing impossible to express instead?
+      └─ YES → do that. Rung 5, and it beats every rung above it. A resolver
+               nobody can bypass beats a gate that refuses. "Never change the
+               data at source" beat a tool that policed changes to the source.
+
+  THE QUESTION TO ASK OF ANY ANSWER
+  ─────────────────────────────────
+      What would have to go wrong for this to fail SILENTLY?
+      If you cannot answer, you have not finished designing it.
+
+TREE
+}
+
+case "${1:-}" in
+"" | -h | --help ) usage; exit 0 ;;
+decide ) decide; exit 0 ;;
+
+off )
+    touch "$KILL_SWITCH"
+    echo "  turnstile OFF — every hook in every repo is skipped."
+    echo "  Nothing is being checked. Turn it back on with: turnstile on"
+    exit 0 ;;
+on )
+    rm -f "$KILL_SWITCH"; echo "  turnstile ON"; exit 0 ;;
+status )
+    if [ -e "$KILL_SWITCH" ]; then echo "  OFF — ~/.turnstile-off exists. No hook is running anywhere."
+    else echo "  ON"; fi
+    n=$(ls "$STATE"/running-* 2>/dev/null | wc -l | tr -d ' ')
+    [ "$n" != 0 ] && { echo "  ⚠ $n hook(s) LATCHED in safe mode after being killed:";
+                       ls "$STATE"/running-* 2>/dev/null | sed 's|^|      |'; }
+    exit 0 ;;
+
+new )
+    name="${2:-}"; [ -n "$name" ] || { echo "usage: turnstile new <name>" >&2; exit 2; }
+    out=".claude/hooks/$name.sh"
+    [ -e "$out" ] && { echo "$out exists" >&2; exit 2; }
+    mkdir -p .claude/hooks
+    sed "s/__NAME__/$name/g" "$SELF_DIR/gate.template.sh" > "$out"
+    chmod +x "$out"
+    echo "  wrote $out"
+    echo
+    echo "  It is ADVISORY until you add '# turnstile: gate' — it can print and cannot block."
+    echo "  Register it wrapped, never directly:"
+    echo
+    echo "      \"command\": \"sh $SELF_REL/turnstile-run $out\""
+    echo
+    echo "  Then: sh $out --selftest     and watch it go red before you trust it."
+    exit 0 ;;
+
+test )
+    fail=0
+    for h in .claude/hooks/*.sh; do
+        [ -f "$h" ] || continue
+        printf '  %-46s ' "$h"
+        if ! grep -q -- '--selftest' "$h"; then echo "NO SELFTEST — untested guard, i.e. a guess"; fail=1; continue; fi
+        out=$(sh "$h" --selftest 2>/dev/null | tail -1)
+        [ "$out" = PASS ] && echo PASS || { echo "$out"; fail=1; }
+    done
+    [ "$fail" = 0 ] && echo "  all green" || exit 1
+    exit 0 ;;
+
+check ) : ;;
+--selftest )
+    f=0
+    decide | grep -q "SHOULD THIS BE A HOOK" || { echo "  FAIL decide tree missing"; f=1; }
+    decide | grep -q "PreToolUse" || { echo "  FAIL tree does not name the survivable shape"; f=1; }
+    [ -f "$SELF_DIR/turnstile-run" ] || { echo "  FAIL wrapper missing"; f=1; }
+    grep -q 'turnstile: gate' "$SELF_DIR/turnstile-run" || { echo "  FAIL wrapper lost its gate declaration logic"; f=1; }
+    [ -f "$SELF_DIR/gate.template.sh" ] || { echo "  FAIL template missing"; f=1; }
+    grep -q -- '--selftest' "$SELF_DIR/gate.template.sh" || { echo "  FAIL template ships without a selftest"; f=1; }
+    [ "$f" = 0 ] && { echo "  ok   tree, wrapper and template present and wired"; echo PASS; exit 0; }
+    echo FAIL; exit 1 ;;
+* ) echo "unknown: $1" >&2; usage; exit 2 ;;
+esac
+
+# ------------------------------------------------------------------- check
+python3 - "$SELF_DIR" <<'PY'
+import json, os, sys, collections
+sd = sys.argv[1]
+cfg = ".claude/settings.json"
+if not os.path.exists(cfg):
+    print("  no .claude/settings.json — no hooks registered here"); raise SystemExit(0)
+try:
+    s = json.load(open(cfg))
+except Exception as e:
+    print(f"  ⚠ settings.json does not parse: {e}")
+    print("    Every hook in this repo is silently not running.")
+    raise SystemExit(1)
+
+rows, seen = [], collections.Counter()
+for ev, groups in (s.get("hooks") or {}).items():
+    for g in groups:
+        for h in g.get("hooks", []):
+            cmd = (h.get("command") or "").strip()
+            seen[(ev, g.get("matcher", "*"), cmd)] += 1
+            rows.append((ev, g.get("matcher", "*"), cmd, h.get("timeout")))
+
+if not rows:
+    print("  settings.json has no hooks"); raise SystemExit(0)
+
+problems = []
+print(f"  {'EVENT':<13}{'MATCHER':<12}{'MODE':<10}{'SIZE':>6}  HOOK")
+for ev, matcher, cmd, _t in rows:
+    parts = cmd.split()
+    wrapped = "turnstile-run" in cmd
+    path = next((p for p in reversed(parts) if p.endswith((".sh", ".py"))), parts[-1] if parts else "")
+    exists = os.path.isfile(path)
+    size = f"{os.path.getsize(path)//1024}KB" if exists else "—"
+    mode = "?"
+    if exists:
+        # Whole file, anchored -- same fix, same reason as turnstile-run: a 40-line
+        # window reported a real gate as undeclared and a real selftest as absent,
+        # because this house writes long incident headers.
+        import re as _re
+        head = open(path, errors="ignore").read()
+        decls = _re.findall(r"(?m)^#[ \t]*turnstile:[ \t]*([a-z0-9 ]*[a-z0-9])[ \t]*$", head)
+        mode = "gate" if "gate" in decls else ("advisory" if decls else "undeclared")
+    flag = "⚠ " if ev == "SessionStart" else "  "
+    print(f"{flag}{ev:<13}{matcher:<12}{mode:<10}{size:>6}  {path}{'' if wrapped else '   [UNWRAPPED]'}")
+
+    if not exists:            problems.append(f"{path} is registered and not on disk — it checks nothing, silently")
+    if not wrapped:           problems.append(f"{path} is not run through turnstile-run — no budget, no kill switch, no safe mode")
+    if ev == "SessionStart":  problems.append(f"{path} is on the BLOCKING startup path (see: turnstile decide)")
+    if exists and "--selftest" not in head:
+        problems.append(f"{path} has no --selftest — an unwatched guard is a guess")
+    if exists and os.path.getsize(path) > 20000:
+        problems.append(f"{path} is {os.path.getsize(path)//1024}KB; hooks that accrete are how sessions stop opening")
+
+for k, n in seen.items():
+    if n > 1: problems.append(f"registered {n}× identically: {k[0]}/{k[1]} {k[2][:60]}")
+
+log = os.path.expanduser("~/.turnstile/timing.log")
+if os.path.exists(log):
+    worst = {}
+    for line in open(log):
+        p = line.split("\t")
+        if len(p) == 4:
+            try: worst[p[3].strip()] = max(worst.get(p[3].strip(), 0), int(p[1]))
+            except ValueError: pass
+    slow = [(k, v) for k, v in worst.items() if v >= 3]
+    if slow:
+        print("\n  measured, slowest run:")
+        for k, v in sorted(slow, key=lambda x: -x[1]): print(f"    {v}s  {k}")
+
+if problems:
+    print(f"\n  {len(problems)} finding(s):")
+    for p in dict.fromkeys(problems): print(f"    · {p}")
+    raise SystemExit(1)
+print("\n  no findings")
+PY

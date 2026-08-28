@@ -1,0 +1,189 @@
+#!/usr/bin/env sh
+# turnstile-run — run a session hook so that it can never cost you the session.
+#
+#   Register hooks through this, never directly:
+#     "command": "sh tools/turnstile/turnstile-run .claude/hooks/my-gate.sh"
+#
+# WHAT IT GUARANTEES, and each guarantee exists because the un-wrapped version of it
+# failed somewhere in this estate:
+#
+#   1. A HOOK YOU DID NOT DECLARE A GATE CANNOT BLOCK YOU. Hooks are advisory by
+#      default. To refuse a command a hook must say `# turnstile: gate` on its own
+#      line. Anything else can print and cannot stop you. This is the whole reason a
+#      beginner can install one safely.
+#
+#   2. A SLOW HOOK CANNOT KILL THE SESSION. Every run has a budget (default 5s, or
+#      `# turnstile: budget N`). Over budget, the hook is killed and the tool exits 0.
+#      A 39KB SessionStart script in this estate grew until sessions died at a 60s
+#      ceiling the editor hardcodes; raising the hook's own timeout changed nothing,
+#      because the hook was never the thing enforcing it.
+#
+#   3. A HOOK THAT WAS KILLED IS DETECTED NEXT TIME. A breadcrumb is dropped before
+#      the hook runs and removed after. Finding a stale one means the last run was
+#      killed, so this run enters SAFE MODE: it prints the diagnosis, skips the hook,
+#      and stays latched until you clear it. Otherwise a hook that kills sessions
+#      kills every session.
+#
+#   4. THERE IS AN OFF SWITCH YOU CAN REACH WITHOUT A SESSION.
+#          touch ~/.turnstile-off     # every hook, every repo, off
+#          rm    ~/.turnstile-off     # back on
+#      In a file in $HOME on purpose: a switch inside the repo is unreachable when the
+#      thing that is broken is what opens the repo.
+#
+#   5. IT SAYS WHEN IT DID NOTHING. Silence from a guard is indistinguishable from a
+#      guard that ran and passed -- the failure this estate has shipped twice. Every
+#      skip prints one line to stderr saying which guarantee skipped it.
+#
+# NO `timeout(1)`. macOS does not ship it, so the budget is implemented here. A wrapper
+# that silently does not enforce its budget on the machine it runs on would be the
+# fail-open bug this whole file exists to prevent.
+#
+# Exit codes: 0 = allow. 2 = blocked (only ever from a declared gate).
+
+set -u
+
+# --------------------------------------------------------------------- selftest
+# THE TOOL THAT DEMANDS A SELFTEST FROM EVERY HOOK SHIPPED WITHOUT ONE. Caught on the
+# day it was written, before it was committed, by running `turnstile check` against
+# its own repo and reading the finding it printed about itself.
+if [ "${1:-}" = "--selftest" ]; then
+    f=0; TD=$(mktemp -d) || exit 1; H="$TD/h.sh"
+    ck() { if [ "$2" = "$3" ]; then printf '  ok   %s\n' "$1"
+           else printf '  FAIL %s (want %s got %s)\n' "$1" "$2" "$3"; f=1; fi; }
+    mk() { printf '#!/usr/bin/env sh\n%s\n' "$1" > "$H"; chmod +x "$H"; }
+    go() { printf '{}' | sh "$0" "$H" >/dev/null 2>"$TD/err"; printf '%s' "$?"; }
+
+    mk '# turnstile: gate
+exit 2';                     ck "1a a declared gate may block"            2 "$(go)"
+    mk 'exit 2';             ck "1b an undeclared hook may NOT block"     0 "$(go)"
+    grep -q ADVISORY "$TD/err" && printf '  ok   1c ...and says so\n' || { printf '  FAIL 1c silent\n'; f=1; }
+
+    mk '# turnstile: gate
+# turnstile: budget 1
+sleep 4; exit 2';            ck "2a over budget cannot block"             0 "$(go)"
+    grep -q "OVER BUDGET" "$TD/err" && printf '  ok   2b ...and says nothing was checked\n' || { printf '  FAIL 2b silent\n'; f=1; }
+
+    mk '# turnstile: gate
+exit 2'
+    slug=$(printf '%s' "$PWD/$H" | tr -c 'A-Za-z0-9' '-' | cut -c1-90)
+    mkdir -p "$HOME/.turnstile"; touch "$HOME/.turnstile/running-$slug"
+    ck "3a a killed previous run latches safe mode"                       0 "$(go)"
+    grep -q "SAFE MODE" "$TD/err" && printf '  ok   3a2 ...and says which guarantee skipped it\n' || { printf '  FAIL 3a2 silent\n'; f=1; }
+    rm -f "$HOME/.turnstile/running-$slug"
+    ck "3b ...and clearing it restores the gate"                          2 "$(go)"
+
+    touch "$HOME/.turnstile-off"
+    ck "4a the kill switch overrides even a gate"                         0 "$(go)"
+    grep -q "OFF" "$TD/err" && printf '  ok   4a2 ...and says nothing was checked\n' || { printf '  FAIL 4a2 silent\n'; f=1; }
+    rm -f "$HOME/.turnstile-off"
+
+    rm -f "$H";              ck "5a a registered hook that is gone cannot block" 0 "$(go)"
+    grep -q MISSING "$TD/err" && printf '  ok   5b ...and says it checked nothing\n' || { printf '  FAIL 5b silent\n'; f=1; }
+
+    # the budget must be enforced HERE: macOS ships no timeout(1)
+    grep -q 'kill -TERM' "$0" || { printf '  FAIL budget not enforced in-file\n'; f=1; }
+
+    rm -rf "$TD"
+    [ $f = 0 ] && { echo PASS; exit 0; } || { echo FAIL; exit 1; }
+fi
+
+HOOK="${1:-}"
+[ -n "$HOOK" ] || { echo "turnstile-run: no hook given" >&2; exit 0; }
+shift 2>/dev/null || true
+
+STATE="${HOME}/.turnstile"
+KILL_SWITCH="${HOME}/.turnstile-off"
+mkdir -p "$STATE" 2>/dev/null
+
+slug=$(printf '%s' "$PWD/$HOOK" | tr -c 'A-Za-z0-9' '-' | cut -c1-90)
+CRUMB="$STATE/running-$slug"
+LOG="$STATE/timing.log"
+
+note() { printf 'turnstile: %s\n' "$*" >&2; }
+
+# ---------------------------------------------------------------- guarantee 4
+if [ -e "$KILL_SWITCH" ]; then
+    note "OFF (~/.turnstile-off exists) — $HOOK did not run, nothing was checked"
+    exit 0
+fi
+
+# ---------------------------------------------------------------- guarantee 3
+if [ -e "$CRUMB" ]; then
+    note "SAFE MODE — the previous run of $HOOK was killed and never finished."
+    note "  Nothing is being checked by it until you clear this:"
+    note "      rm '$CRUMB'"
+    note "  If it keeps happening the hook is too slow or is hanging; see"
+    note "      tools/turnstile/turnstile check"
+    exit 0
+fi
+
+[ -f "$HOOK" ] || { note "MISSING: $HOOK is registered but not on disk — nothing was checked"; exit 0; }
+
+# --------------------------------------------------- declaration (guarantee 1)
+# WHOLE FILE, anchored. The first version read only the first 40 lines, on the theory
+# that a mention further down is prose about turnstile rather than a declaration. It cost
+# an hour on the day it was written: this estate writes 40+ line incident headers, so the
+# very first real gate wrapped by this tool had its `# turnstile: gate` line at 44 and was
+# SILENTLY DOWNGRADED TO ADVISORY. It stopped blocking and nothing said the mode had
+# changed -- a fail-open produced by the safety wrapper, which is the whole class this
+# file exists to prevent.
+#
+# Precision comes from anchoring instead of from a window: the line must be exactly a
+# declaration and nothing else, so `# turnstile: gate` inside a sentence, or in backticks
+# in documentation, does not count.
+decl=$(sed -n 's/^#[[:space:]]*turnstile:[[:space:]]*\([a-z0-9 ]*[a-z0-9]\)[[:space:]]*$/\1/p' "$HOOK")
+MODE=advisory
+BUDGET=5
+for d in $decl; do
+    case "$d" in
+        gate)     MODE=gate ;;
+        advisory) MODE=advisory ;;
+        budget)   want_budget=1 ;;
+        *) if [ "${want_budget:-0}" = 1 ]; then
+               case "$d" in ''|*[!0-9]*) : ;; *) BUDGET="$d" ;; esac
+               want_budget=0
+           fi ;;
+    esac
+done
+
+# ------------------------------------------------------------------ the payload
+PAYLOAD=$(mktemp "$STATE/payload.XXXXXX") || exit 0
+cat > "$PAYLOAD" 2>/dev/null
+trap 'rm -f "$PAYLOAD"; rm -f "$CRUMB"' EXIT INT TERM
+
+# ---------------------------------------------------- guarantees 2 and 3, jointly
+date +%s > "$CRUMB" 2>/dev/null
+start=$(date +%s)
+
+sh "$HOOK" "$@" < "$PAYLOAD" &
+hpid=$!
+( sleep "$BUDGET"; kill -TERM "$hpid" 2>/dev/null; sleep 1; kill -KILL "$hpid" 2>/dev/null ) &
+wpid=$!
+
+wait "$hpid" 2>/dev/null; rc=$?
+kill -TERM "$wpid" 2>/dev/null
+wait "$wpid" 2>/dev/null
+
+end=$(date +%s)
+elapsed=$((end - start))
+rm -f "$CRUMB"
+printf '%s\t%s\t%s\t%s\n' "$(date +%FT%T)" "$elapsed" "$rc" "$HOOK" >> "$LOG" 2>/dev/null
+
+# A shell reports a killed child as 128+signal. 143 = TERM, 137 = KILL.
+if [ "$rc" -ge 128 ] || [ "$elapsed" -ge "$BUDGET" ]; then
+    note "OVER BUDGET — $HOOK exceeded ${BUDGET}s and was killed. NOTHING IT CHECKS WAS CHECKED."
+    note "  This is deliberate: a hook may not cost you the session. Raise it with"
+    note "  '# turnstile: budget N' in the hook, or make the hook faster."
+    exit 0
+fi
+
+# ---------------------------------------------------------------- guarantee 1
+if [ "$MODE" != gate ]; then
+    if [ "$rc" != 0 ]; then
+        note "ADVISORY — $HOOK wanted to block (exit $rc) and was not allowed to."
+        note "  It has no '# turnstile: gate' line. Add one if refusing is the point."
+    fi
+    exit 0
+fi
+
+exit "$rc"
